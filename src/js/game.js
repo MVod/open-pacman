@@ -11,7 +11,14 @@ const DIRS = {
 const OPPOSITE = { left: 'right', right: 'left', up: 'down', down: 'up' };
 
 const PACMAN_SPEED = 0.125; // 1/8 celda/frame -> alinea cada 8 frames
-const GHOST_SPEED = 0.1;    // 1/10 celda/frame
+
+// Perfil por tipo de fantasma: velocidad (fraccion limpia) y frame de salida.
+const GHOST_KINDS = {
+  chaser: { speed: 0.125, releaseFrame: 0   }, // agresivo, igual que Pac-Man
+  ambush: { speed: 0.1,   releaseFrame: 30  },
+  flank:  { speed: 0.1,   releaseFrame: 60  },
+  shy:    { speed: 0.1,   releaseFrame: 90  },
+};
 
 // Crea una partida nueva. Copia MAZE (pristino) a game.grid para poder comer
 // dots sin destruir el original, y reiniciar.
@@ -36,14 +43,24 @@ function createGame() {
       nextDir: null,
       speed: PACMAN_SPEED,
     },
-    ghosts: GHOST_STARTS.map( ( g ) => ( {
-      x: g.x,
-      y: g.y,
-      dir: 'up',
-      speed: GHOST_SPEED,
-      kind: g.kind,
-    } ) ),
+    ghosts: GHOST_STARTS.map( ( g ) => {
+      const profile = GHOST_KINDS[ g.kind ];
+      return {
+        x: g.x,
+        y: g.y,
+        dir: 'up',
+        speed: profile.speed,
+        kind: g.kind,
+        color: g.color,
+        releaseFrame: profile.releaseFrame,
+      };
+    } ),
   };
+}
+
+// Un fantasma se mueve solo cuando el frame supera su releaseFrame.
+function ghostReleased( game, g ) {
+  return game.frame > g.releaseFrame;
 }
 
 function aligned( v ) {
@@ -110,9 +127,45 @@ function movePacman( game ) {
   wrapTunnel( p, width );
 }
 
+// Codigo greedy: elige la direccion que acerca al objeto (tx,ty).
+function greedyToward( choices, g, tx, ty ) {
+  let best = choices[ 0 ];
+  let bestDist = Infinity;
+  for ( const dir of choices ) {
+    const d = DIRS[ dir ];
+    const nx = g.x + d.x;
+    const ny = g.y + d.y;
+    const dist = Math.abs( nx - tx ) + Math.abs( ny - ty );
+    if ( dist < bestDist ) {
+      bestDist = dist;
+      best = dir;
+    }
+  }
+  return best;
+}
+
+function clampCell( v, max ) {
+  return Math.max( 0, Math.min( max, Math.round( v ) ) );
+}
+
+// Objeto de emboscada: 4 celdas por delante de Pac-Man en su dir,
+// clamped a los bordes del laberinto.
+function ambushTarget( game ) {
+  const p = game.pacman;
+  const d = DIRS[ p.dir ];
+  const W = game.grid[ 0 ].length;
+  const H = game.grid.length;
+  return {
+    x: clampCell( p.x + d.x * 4, W - 1 ),
+    y: clampCell( p.y + d.y * 4, H - 1 ),
+  };
+}
+
 function decideGhost( game, g ) {
   const grid = game.grid;
   const p = game.pacman;
+  const px = Math.round( p.x );
+  const py = Math.round( p.y );
 
   const options = Object.keys( DIRS ).filter(
     ( dir ) => dir !== OPPOSITE[ g.dir ] && canMove( grid, g.x, g.y, dir, 'ghost' )
@@ -120,22 +173,26 @@ function decideGhost( game, g ) {
   // Sin salida (callejon): permitir el giro de 180.
   const choices = options.length ? options : [ '' + OPPOSITE[ g.dir ] ];
 
-  if ( g.kind === 'hunter' ) {
-    const px = Math.round( p.x );
-    const py = Math.round( p.y );
-    let best = choices[ 0 ];
-    let bestDist = Infinity;
-    for ( const dir of choices ) {
-      const d = DIRS[ dir ];
-      const nx = g.x + d.x;
-      const ny = g.y + d.y;
-      const dist = Math.abs( nx - px ) + Math.abs( ny - py );
-      if ( dist < bestDist ) {
-        bestDist = dist;
-        best = dir;
-      }
+  if ( g.kind === 'chaser' ) {
+    // Codicio greedy directo hacia Pac-Man.
+    g.dir = greedyToward( choices, g, px, py );
+  } else if ( g.kind === 'ambush' ) {
+    // Apunta a 4 celdas por delante de Pac-Man; no se queda pegado.
+    const t = ambushTarget( game );
+    g.dir = greedyToward( choices, g, t.x, t.y );
+  } else if ( g.kind === 'flank' ) {
+    // Simetria respecto al eje central vertical (entre cols 13 y 14).
+    const W = grid[ 0 ].length;
+    const tx = Math.round( ( W - 1 ) - px );
+    g.dir = greedyToward( choices, g, tx, py );
+  } else if ( g.kind === 'shy' ) {
+    // Cercano: persigue; lejos: deambula.
+    const dist = Math.abs( g.x - p.x ) + Math.abs( g.y - p.y );
+    if ( dist <= 5 ) {
+      g.dir = greedyToward( choices, g, px, py );
+    } else {
+      g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
     }
-    g.dir = best;
   } else {
     g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
   }
@@ -168,6 +225,8 @@ function resetPositions( game ) {
     g.x = GHOST_STARTS[ i ].x;
     g.y = GHOST_STARTS[ i ].y;
     g.dir = 'up';
+    // Read-arma el countdown desde el frame actual.
+    g.releaseFrame = game.frame + GHOST_KINDS[ g.kind ].releaseFrame;
   } );
 }
 
@@ -177,9 +236,13 @@ function collides( a, b ) {
 
 function update( game ) {
   movePacman( game );
-  game.ghosts.forEach( ( g ) => moveGhost( game, g ) );
+  // Un fantasma congelado (countdown) no se mueve y no colisiona.
+  game.ghosts.forEach( ( g ) => {
+    if ( ghostReleased( game, g ) ) moveGhost( game, g );
+  } );
 
   for ( const g of game.ghosts ) {
+    if ( !ghostReleased( game, g ) ) continue;
     if ( collides( game.pacman, g ) ) {
       game.lives--;
       if ( game.lives <= 0 ) {
